@@ -1,0 +1,35 @@
+# Example: llm-gate in Docker in front of llama-server running on the host (port 8081).
+# The embedding worker (embed_worker.py) runs on the host next to llama-server; see README.md.
+services:
+  llm-gate:
+    build: .
+    container_name: llm-gate
+    ports:
+      - '127.0.0.1:8090:8090'  # publish on a LAN address too if other machines use it
+    volumes:
+      - ./keys:/keys:ro          # clients.txt (client keys) and upstream.txt (llama-server's key)
+      - ./archive:/archive       # long-chat archive (SQLite); omit with ARCHIVE_DB
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    environment:
+      - UPSTREAM=http://host.docker.internal:8081
+      - KEYS_FILE=/keys/clients.txt
+      - UPSTREAM_KEY_FILE=/keys/upstream.txt
+      - MAX_ACTIVE=1             # match llama-server's -np
+      - MAX_WAITING=8
+      - DEFAULT_MODEL=gpt-oss-20b
+      # - AUTO_MODEL=auto        # extra model name meaning DEFAULT_MODEL
+      # - RETURN_AFTER=120       # reload DEFAULT_MODEL after this many idle seconds (router mode)
+      # - PRIORITY=automation    # key names that go first
+      # - HOLD=30
+      # - VISION_MODELS=gemma-3-12b
+      # - VISION_FALLBACK=gemma-3-12b
+      # - RESTRICTED=big-model:alice|bob
+      # - TRUSTED_PROXIES=172.   # a reverse proxy in Docker that sets X-Real-IP / CF-Connecting-IP
+      - ARCHIVE_DB=/archive/chats.sqlite
+      - ARCHIVE_KEYS=alice,bob
+      - ARCHIVE_LIMITS=gpt-oss-20b:44000
+      - ARCHIVE_DEFAULT_LIMIT=20000
+      - ARCHIVE_TOOL_MODELS=gpt-oss-20b
+      - EMBED_URL=http://host.docker.internal:8098
+    restart: unless-stopped
