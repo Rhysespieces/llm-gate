@@ -30,6 +30,7 @@ SECTION_TOKENS = 2500  # archived messages are grouped into index sections of ab
 MAX_INDEX_LINES = 40  # longer indexes merge neighbouring sections
 INDEX_TOKENS = 3000  # room kept for the index and tool definitions when planning a cut
 READ_TOKENS = 4000  # most archive_read returns at once
+STICKY_CONVS = 200  # conversations whose chosen excerpts are remembered (in memory; a restart costs one full re-read)
 STOP = set("the and for that this with you your are was were have has had not but what when where which who why how "
            "can could would should will just from they them then than there their about into also some more very "
            "does did done its it's i'm i've don't please thanks".split())
@@ -207,6 +208,7 @@ class Archive:
     def __init__(self, path, recall_tokens=3000):
         self.db = connect(path)
         self.recall_tokens = recall_tokens
+        self.sticky = {}  # conv -> (key of the user message, excerpt block, count): see recall()
 
     def prepare(self, payload, who, limit):
         """Trim payload['messages'] in place if needed. Returns (conv, query, info) when the archive is in use,
@@ -329,23 +331,53 @@ class Archive:
                              for msg, part, role, t in hits) or ("No matches in the archive. Only the earlier messages listed in the archive index "
                                                   "are archived; recent messages are in your context above.")
 
+    def _recall_target(self, payload, tools):
+        """(index, key) of the latest user message, which gets the excerpts; (None, None) if there is none."""
+        msgs = payload["messages"]
+        for i in range(len(msgs) - 1, -1, -1):
+            if msgs[i].get("role") == "user":
+                return i, digest([msgs[i].get("content"), bool(tools)])
+        return None, None
+
+    def recall_query(self, payload, conv, tools=False):
+        """Text to search the archive for, or None when the latest user message already has its excerpts (they are
+        reused as they are, so no new query embedding is needed)."""
+        i, key = self._recall_target(payload, tools)
+        if i is None or (self.sticky.get(conv) or (None,))[0] == key:
+            return None
+        return text_of(payload["messages"][i])[-2000:]
+
     def recall(self, payload, conv, query, qvec, tools=False):
-        """Append matching archive excerpts to the latest message. Returns how many were added."""
-        hits = search(self.db, conv, query, qvec, self.recall_tokens)
-        last = payload["messages"][-1]
-        if not hits or last.get("role") not in ("user", "tool"):
+        """Attach matching archive excerpts to the latest user message. Returns how many are attached.
+
+        Excerpts are chosen once per user message and then re-attached word for word on every following request
+        (agent tool loops send dozens). Choosing new ones per request changed the middle of the prompt each time,
+        and llama-server can't reuse a partial cache for gpt-oss (sliding-window layers), so it re-read the whole
+        chat on every step: ~60 s at 22k tokens instead of a few seconds. Between user messages the model can
+        still look things up with archive_read/archive_search."""
+        i, key = self._recall_target(payload, tools)
+        if i is None:
             return 0
-        text = "\n\n".join(f"--- message {msg + 1} ({role}){' cont.' if part else ''} ---\n{t}" for msg, part, role, t in hits)
-        end = ("[End of archived excerpts. They are search matches with gaps between them, not the conversation in "
-               "order: for what came first, next or where, go by the archive index in the system message, and use "
-               "archive_read or archive_search when these excerpts don't settle the answer.]" if tools else "[End of archived excerpts]")
-        block = f"\n\n[Archived excerpts from earlier in this conversation (search matches only)]\n{text}\n{end}"
-        c = last.get("content")
-        if isinstance(c, list):
-            last["content"] = c + [{"type": "text", "text": block}]
-        else:
-            last["content"] = (c or "") + block
-        return len(hits)
+        st = self.sticky.get(conv)
+        if not st or st[0] != key:
+            hits = search(self.db, conv, query, qvec, self.recall_tokens) if query else []
+            block = ""
+            if hits:
+                text = "\n\n".join(f"--- message {msg + 1} ({role}){' cont.' if part else ''} ---\n{t}" for msg, part, role, t in hits)
+                end = ("[End of archived excerpts. They are search matches with gaps between them, not the conversation in "
+                       "order: for what came first, next or where, go by the archive index in the system message, and use "
+                       "archive_read or archive_search when these excerpts don't settle the answer.]" if tools else "[End of archived excerpts]")
+                block = f"\n\n[Archived excerpts from earlier in this conversation (search matches only)]\n{text}\n{end}"
+            st = (key, block, len(hits))
+            self.sticky.pop(conv, None)
+            self.sticky[conv] = st
+            while len(self.sticky) > STICKY_CONVS:
+                self.sticky.pop(next(iter(self.sticky)))
+        if st[1]:
+            m = payload["messages"][i]
+            c = m.get("content")
+            payload["messages"][i] = dict(m, content=c + [{"type": "text", "text": st[1]}] if isinstance(c, list) else (c or "") + st[1])
+        return st[2]
 
 
 def normalize(v):

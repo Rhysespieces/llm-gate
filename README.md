@@ -86,6 +86,7 @@ One Python file for the gate, one for the archive; aiohttp is the only dependenc
 | `ARCHIVE_LIMITS` / `ARCHIVE_DEFAULT_LIMIT` | none / `20000` | `model:tokens,...`: when to archive (gate estimate, see below) |
 | `ARCHIVE_TOOL_MODELS` | none | models that get `archive_read` / `archive_search` |
 | `EMBED_URL` | none | embedding server for meaning search; keywords only without it |
+| `CLIENT_RULES` / `CLIENT_RULES_DIR` | none / `/rules` | `keyname:file.md,...`: rules appended to Cline's system prompt for that key (see below) |
 
 ## Long-chat archive
 
@@ -96,7 +97,7 @@ oldest messages into SQLite. The model then sees:
 system prompt + archive index
 first user message            (always kept: it usually states the task)
 recent messages, unchanged
-latest message + excerpts from the archive that match it
+latest user message + excerpts from the archive that match it
 ```
 
 The **index** has one line per ~2.5k tokens of archived messages: the message range, a one-line summary, and the
@@ -125,8 +126,13 @@ slow part: about 40 s for 22k tokens at 580 tokens/s. The design follows from th
 
 - **Cuts move in big steps.** When the history passes the limit, the gate archives down to half the limit. The
   start of the prompt then stays the same, and stays cached, until the history grows back to the limit.
-- **The index lives in the system message**, which only changes at a cut. The excerpts change every turn, so they
-  go on the latest message.
+- **The index lives in the system message**, which only changes at a cut.
+- **Excerpts are chosen once per user message** and attached to it, then re-attached word for word on every
+  following request. Agents (Cline and similar) send dozens of tool-result requests per user message; picking new
+  excerpts for each one changed the middle of the prompt every time, and llama-server can't reuse a partial cache for
+  models with sliding-window layers (gpt-oss), so every agent step reread the whole chat (60–80 s at 22k tokens).
+  Between user messages the model uses `archive_read` / `archive_search`. The chosen excerpts are kept in memory for
+  200 chats; after a gate restart the first request rereads once.
 - **Summaries are written during the reply that makes the cut.** That reply rereads the prompt anyway. A
   background summary job would push the chat out of the cache slot, and the next message would pay for a full
   reread. The first cut of a long chat takes 30–40 s longer; later cuts less. On failure or timeout, the index
@@ -136,6 +142,14 @@ slow part: about 40 s for 22k tokens at 580 tokens/s. The design follows from th
 
 Token counts are estimated at 2.8 characters per token without calling the tokenizer. That's conservative: 85k
 estimated ≈ 60k real for prose. Set `ARCHIVE_LIMITS` to about 65% of the context size.
+
+### Rules for agents on client machines
+
+`CLIENT_RULES=laptop:cline-windows.md` appends `CLIENT_RULES_DIR/cline-windows.md` to the system prompt of requests
+made with the `laptop` key whose system prompt is Cline's. Use it to give a small model house rules (how to edit
+files safely, what never to run, when to stop) without installing anything on that machine. The file is read on every
+request, so edits apply at once; its text only changes when the file does, so the prompt cache stays valid. Mount
+the folder read-only, e.g. `./rules:/rules:ro`.
 
 ### Embedding worker
 

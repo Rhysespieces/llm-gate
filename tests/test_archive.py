@@ -60,6 +60,31 @@ class ArchiveTest(unittest.TestCase):
         self.assertFalse(info2["new_cut"])
         self.assertEqual(p2["messages"][:len(p1["messages"])], p1["messages"])
 
+    def request(self, msgs):
+        """prepare + recall + note, as the gate does for one request."""
+        p, (conv, _, info) = self.prepare(msgs)
+        q = self.a.recall_query(p, conv, True)
+        n = self.a.recall(p, conv, q, None, True)
+        self.a.add_note(p, conv, info, True)
+        return p, n, q
+
+    def test_agent_tool_loop_keeps_prefix(self):
+        msgs = chat(40) + [{"role": "user", "content": "What was the code word for note 3?"}]
+        p1, n1, q1 = self.request(msgs)
+        self.assertTrue(q1 and n1 > 0)
+        for step in range(3):  # tool rounds: same user message, new tool results at the end
+            msgs = msgs + [{"role": "assistant", "content": "", "tool_calls": [
+                               {"id": f"c{step}", "type": "function", "function": {"name": "read", "arguments": "{}"}}]},
+                           {"role": "tool", "tool_call_id": f"c{step}", "content": f"result {step}"}]
+            p2, n2, q2 = self.request(msgs)
+            self.assertIsNone(q2)  # excerpts reused, no new search
+            self.assertEqual(n2, n1)
+            self.assertEqual(p2["messages"][:len(p1["messages"])], p1["messages"])
+            p1 = p2
+        p3, _, q3 = self.request(msgs + [{"role": "user", "content": "And note 5?"}])
+        self.assertTrue(q3)  # a new user message gets its own excerpts
+        self.assertNotIn("Archived excerpts", str(p3["messages"][-2]))
+
     def test_index_read_and_search(self):
         payload, (conv, _, info) = self.prepare(chat(40))
         self.a.add_note(payload, conv, info, True)

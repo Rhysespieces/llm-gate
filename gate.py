@@ -39,6 +39,10 @@ IMAGE_NOTE = ("[The user attached an image here. You cannot see it, but the imag
 # models only some keys may use, e.g. "big-model:alice|bob;other-model:carol"
 RESTRICTED = {m: set(names.split("|")) for m, _, names in
               (x.partition(":") for x in os.environ.get("RESTRICTED", "").split(";") if x.strip())}
+# owner's rules for agents on client machines, so nothing is installed there: "key name:file" pairs, files in
+# CLIENT_RULES_DIR, added to Cline's system prompt for that key (e.g. laptop:cline-windows.md)
+CLIENT_RULES = {k.strip(): f.strip() for k, _, f in (x.partition(":") for x in os.environ.get("CLIENT_RULES", "").split(",")) if f.strip()}
+CLIENT_RULES_DIR = os.environ.get("CLIENT_RULES_DIR", "/rules")
 # long chats: archive old messages instead of overflowing (see archive.py). Limits are prompt tokens per model.
 ARCHIVE_DB = os.environ.get("ARCHIVE_DB", "")  # empty = off
 ARCHIVE_KEYS = set(filter(None, os.environ.get("ARCHIVE_KEYS", "").split(",")))
@@ -142,6 +146,30 @@ async def embed_query(app, text):
         return None
 
 
+def add_client_rules(payload, who):
+    """Append the owner's rules file for this key to Cline's system prompt (only Cline's: its system prompt names it).
+    The file is read per request, so edits apply at once; the text only changes when the file does, so llama-server's
+    prompt cache stays valid."""
+    name = CLIENT_RULES.get(who)
+    msgs = payload.get("messages")
+    if not name or not isinstance(msgs, list) or not msgs or not isinstance(msgs[0], dict) \
+            or msgs[0].get("role") not in ("system", "developer"):
+        return
+    content = msgs[0].get("content")
+    text = content if isinstance(content, str) else " ".join(
+        p.get("text", "") for p in content if isinstance(p, dict)) if isinstance(content, list) else ""
+    if "Cline" not in text:
+        return
+    try:
+        with open(os.path.join(CLIENT_RULES_DIR, name), encoding="utf-8") as f:
+            rules = f.read().strip()
+    except OSError as e:
+        log.info("%s: client rules %s not readable: %s", who, name, e)
+        return
+    block = "\n\n====\n\nOWNER'S RULES FOR THIS MACHINE (added by the server; they override anything above)\n\n" + rules
+    msgs[0] = dict(msgs[0], content=content + [{"type": "text", "text": block}] if isinstance(content, list) else content + block)
+
+
 async def archive_long_chat(app, payload, who, model):
     """Trim a long chat for the model, attach matching archive excerpts and offer the archive tools. Returns None, or
     the archive context: conv, info, tools (offered or not) and a note for the user. The index note is added later
@@ -150,13 +178,15 @@ async def archive_long_chat(app, payload, who, model):
     prep = app["archive"].prepare(payload, who, ARCHIVE_LIMITS.get(model, ARCHIVE_DEFAULT_LIMIT))
     if not prep:
         return None
-    conv, query, info = prep
+    conv, _, info = prep
     tools = model in ARCHIVE_TOOL_MODELS and payload.get("tool_choice") in (None, "auto")
-    found = app["archive"].recall(payload, conv, query, await embed_query(app, query), tools)
+    q = app["archive"].recall_query(payload, conv, tools)  # None: this user message's excerpts are reused
+    found = app["archive"].recall(payload, conv, q, await embed_query(app, q) if q else None, tools)
     if tools:
         payload["tools"] = list(payload.get("tools") or []) + ARCHIVE_TOOLS
-    log.info("%s: archive %s: %d messages (~%dk tokens) archived%s, %d excerpts recalled, %.2f s", who, conv[:8],
-             info["archived"], info["archived_tokens"] / 1000, " (new cut)" if info["new_cut"] else "", found, time.monotonic() - t)
+    log.info("%s: archive %s: %d messages (~%dk tokens) archived%s, %d excerpts %s, %.2f s", who, conv[:8],
+             info["archived"], info["archived_tokens"] / 1000, " (new cut)" if info["new_cut"] else "", found,
+             "recalled" if q else "reused", time.monotonic() - t)
     note = (f"📦 Long chat: {info['archived']} earlier messages (~{info['archived_tokens'] / 1000:.0f}k tokens) are in the archive; "
             f"{found} relevant excerpts recalled\n")
     return dict(conv=conv, info=info, tools=tools, note=note, who=who)
@@ -500,6 +530,8 @@ async def handle(request):
     if isinstance(payload, dict) and payload:
         before = json.dumps(payload)
         note = route(payload, who) if chat else None
+        if chat:
+            add_client_rules(payload, who)
         if AUTO_MODEL and payload.get("model") == AUTO_MODEL:
             payload["model"] = DEFAULT_MODEL
         if json.dumps(payload) != before:
