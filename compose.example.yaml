@@ -34,4 +34,5 @@ services:
       - ARCHIVE_TOOL_MODELS=gpt-oss-20b
       - EMBED_URL=http://host.docker.internal:8098
       # - CLIENT_RULES=laptop:cline-windows.md  # rules appended to Cline's system prompt for that key
+      # - AGENT_MAX_TOKENS=6000  # most tokens one Cline step may generate
     restart: unless-stopped

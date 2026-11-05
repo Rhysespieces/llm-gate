@@ -12,6 +12,7 @@ llama-server is the only other holder of, so client keys don't work on llama-ser
 See README.md for the settings.
 """
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -43,6 +44,23 @@ RESTRICTED = {m: set(names.split("|")) for m, _, names in
 # CLIENT_RULES_DIR, added to Cline's system prompt for that key (e.g. laptop:cline-windows.md)
 CLIENT_RULES = {k.strip(): f.strip() for k, _, f in (x.partition(":") for x in os.environ.get("CLIENT_RULES", "").split(",")) if f.strip()}
 CLIENT_RULES_DIR = os.environ.get("CLIENT_RULES_DIR", "/rules")
+# agent safeguards: repeated identical tool calls get a note (all requests with tools); most tokens one Cline step may
+# generate (0 = client's own limit), so a runaway step (a model stuck in its reasoning, ~9k tokens / 3+ min seen) ends in about AGENT_MAX_TOKENS / 45 s
+AGENT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "0"))
+REPEAT_NOTE = ("\n\n[Gate note: this is call {n} of exactly this tool with exactly these arguments in this task. "
+               "If nothing changed since the last one, the result is the same as before. Don't make this call again: "
+               "use the result you have, do the next different step, or if the task is done, finish it now.]")
+# debug: keys whose agent tasks are saved (whole history as the model saw it, one JSON file per task, overwritten as
+# the task goes on) to find where an agent goes wrong. Local files on this server only; delete when done.
+TRANSCRIPT_KEYS = set(filter(None, os.environ.get("TRANSCRIPT_KEYS", "").split(",")))
+TRANSCRIPT_DIR = os.environ.get("TRANSCRIPT_DIR", "/archive/transcripts")
+# file-read tools whose results number every line (" 12 | text"). Small models copy those numbers into their edits,
+# and Cline's apply_patch applies non-matching patches anyway (fuzz), so the numbers end up in the file, the model
+# "repairs" it, and finally rewrites the whole file. The gate shows the model plain lines instead.
+NUMBERED_READ_TOOLS = set(filter(None, os.environ.get("NUMBERED_READ_TOOLS", "read_files,read_file").split(",")))
+LINE_NUMBER = re.compile(r"(?m)^ *\d+ \| ")
+REWRITE_NOTE = ("\n\n[Gate note: this task has now changed {path} {n} times. Stop changing it: read it once to check "
+                "it, then finish the task, or tell the user what still goes wrong and ask how to proceed.]")
 # long chats: archive old messages instead of overflowing (see archive.py). Limits are prompt tokens per model.
 ARCHIVE_DB = os.environ.get("ARCHIVE_DB", "")  # empty = off
 ARCHIVE_KEYS = set(filter(None, os.environ.get("ARCHIVE_KEYS", "").split(",")))
@@ -156,9 +174,7 @@ def add_client_rules(payload, who):
             or msgs[0].get("role") not in ("system", "developer"):
         return
     content = msgs[0].get("content")
-    text = content if isinstance(content, str) else " ".join(
-        p.get("text", "") for p in content if isinstance(p, dict)) if isinstance(content, list) else ""
-    if "Cline" not in text:
+    if not is_cline(payload):
         return
     try:
         with open(os.path.join(CLIENT_RULES_DIR, name), encoding="utf-8") as f:
@@ -168,6 +184,101 @@ def add_client_rules(payload, who):
         return
     block = "\n\n====\n\nOWNER'S RULES FOR THIS MACHINE (added by the server; they override anything above)\n\n" + rules
     msgs[0] = dict(msgs[0], content=content + [{"type": "text", "text": block}] if isinstance(content, list) else content + block)
+
+
+def is_cline(payload):
+    msgs = payload.get("messages")
+    if not isinstance(msgs, list) or not msgs or not isinstance(msgs[0], dict):
+        return False
+    c = msgs[0].get("content")
+    text = c if isinstance(c, str) else " ".join(p.get("text", "") for p in c if isinstance(p, dict)) if isinstance(c, list) else ""
+    return msgs[0].get("role") in ("system", "developer") and "Cline" in text
+
+
+def edited_path(arguments):
+    try:
+        a = json.loads(arguments or "{}")
+    except (ValueError, TypeError):
+        return None
+    p = a.get("path") or a.get("file_path") or a.get("absolutePath") if isinstance(a, dict) else None
+    return p.strip() if isinstance(p, str) and p.strip() else None
+
+
+def save_transcript(payload, who):
+    msgs = payload.get("messages")
+    if who not in TRANSCRIPT_KEYS or not payload.get("tools") or not isinstance(msgs, list):
+        return
+    first = next((m for m in msgs if isinstance(m, dict) and m.get("role") == "user"), None)
+    task = hashlib.sha256(json.dumps(first, sort_keys=True).encode()).hexdigest()[:10]
+    out = re.sub(r'"data:[^"]{200,}"', '"(image removed)"', json.dumps(
+        {"saved": time.strftime("%Y-%m-%d %H:%M:%S"), "who": who, "model": payload.get("model"),
+         "max_tokens": payload.get("max_tokens"), "tools": [t.get("function", {}).get("name") for t in payload["tools"]
+                                                            if isinstance(t, dict)], "messages": msgs},
+        ensure_ascii=False, indent=1))
+    try:
+        os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
+        with open(os.path.join(TRANSCRIPT_DIR, f"{who}-{time.strftime('%Y%m%d')}-{task}.json"), "w", encoding="utf-8") as f:
+            f.write(out)
+    except OSError as e:
+        log.info("%s: transcript not saved: %s", who, e)
+
+
+def unnumber(content):
+    """Strip line numbers from a file-read result: Cline's JSON list of {query, result} or plain text."""
+    if not isinstance(content, str):
+        return content
+    try:
+        items = json.loads(content)
+    except ValueError:
+        return LINE_NUMBER.sub("", content)
+    if not isinstance(items, list):
+        return content
+    for it in items:
+        if isinstance(it, dict) and isinstance(it.get("result"), str):
+            it["result"] = LINE_NUMBER.sub("", it["result"])
+    return json.dumps(items, ensure_ascii=False)
+
+
+def agent_safeguards(payload, who):
+    """For agent requests (they carry tools): note repeated identical tool calls on their results, and cap one step's
+    output. Small models loop by repeating the same call (rewriting a file with the same content, rereading the same
+    file). The notes are worked out from the history alone, so every request re-adds the same notes in the same
+    places and llama-server's prompt cache stays valid."""
+    msgs = payload.get("messages")
+    if not payload.get("tools") or not isinstance(msgs, list):
+        return
+    if AGENT_MAX_TOKENS and is_cline(payload):  # Open WebUI answers may legitimately be long
+        for k in ("max_tokens", "max_completion_tokens"):
+            if k == "max_tokens" or k in payload:
+                payload[k] = min(int(payload.get(k) or AGENT_MAX_TOKENS), AGENT_MAX_TOKENS)
+    seen, repeats, names = {}, {}, {}
+    for i, m in enumerate(msgs):
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "tool" and names.get(m.get("tool_call_id")) in NUMBERED_READ_TOOLS:
+            m = msgs[i] = dict(m, content=unnumber(m.get("content")))
+        if m.get("role") == "assistant":
+            for tc in m.get("tool_calls") or []:
+                f = tc.get("function") or {}
+                name = str(f.get("name") or "")
+                names[tc.get("id")] = name
+                key = (name, f.get("arguments"))
+                seen[key] = seen.get(key, 0) + 1
+                if seen[key] >= 2:
+                    repeats[tc.get("id")] = (name, seen[key], REPEAT_NOTE.format(n=seen[key]))
+                elif any(w in name for w in ("write", "replace", "edit", "patch")):
+                    path = edited_path(f.get("arguments"))
+                    if path:
+                        seen[("file", path)] = n = seen.get(("file", path), 0) + 1
+                        if n >= 3:
+                            repeats[tc.get("id")] = (name, n, REWRITE_NOTE.format(path=path, n=n))
+        elif m.get("role") == "tool" and m.get("tool_call_id") in repeats:
+            note = repeats[m["tool_call_id"]][2]
+            c = m.get("content")
+            msgs[i] = dict(m, content=c + [{"type": "text", "text": note}] if isinstance(c, list) else (c or "") + note)
+    if repeats:
+        last = max(repeats.values(), key=lambda x: x[1])
+        log.info("%s: %d repeated tool calls noted (most: %s x%d)", who, len(repeats), last[0], last[1])
 
 
 async def archive_long_chat(app, payload, who, model):
@@ -532,6 +643,8 @@ async def handle(request):
         note = route(payload, who) if chat else None
         if chat:
             add_client_rules(payload, who)
+            agent_safeguards(payload, who)
+            save_transcript(payload, who)
         if AUTO_MODEL and payload.get("model") == AUTO_MODEL:
             payload["model"] = DEFAULT_MODEL
         if json.dumps(payload) != before:

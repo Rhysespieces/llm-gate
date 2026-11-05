@@ -87,6 +87,9 @@ One Python file for the gate, one for the archive; aiohttp is the only dependenc
 | `ARCHIVE_TOOL_MODELS` | none | models that get `archive_read` / `archive_search` |
 | `EMBED_URL` | none | embedding server for meaning search; keywords only without it |
 | `CLIENT_RULES` / `CLIENT_RULES_DIR` | none / `/rules` | `keyname:file.md,...`: rules appended to Cline's system prompt for that key (see below) |
+| `AGENT_MAX_TOKENS` | `0` (off) | most tokens one Cline step may generate; stops runaway steps |
+| `NUMBERED_READ_TOOLS` | `read_files,read_file` | file-read tools whose results get their line numbers removed (see below) |
+| `TRANSCRIPT_KEYS` / `TRANSCRIPT_DIR` | none / `/archive/transcripts` | debug: save each agent task of these keys as JSON |
 
 ## Long-chat archive
 
@@ -150,6 +153,22 @@ made with the `laptop` key whose system prompt is Cline's. Use it to give a smal
 files safely, what never to run, when to stop) without installing anything on that machine. The file is read on every
 request, so edits apply at once; its text only changes when the file does, so the prompt cache stays valid. Mount
 the folder read-only, e.g. `./rules:/rules:ro`.
+
+### Agent safeguards (Cline with a small local model)
+
+Measured with real Cline CLI tasks (5 edits on CRLF PowerShell/batch/JSON files, checked automatically, 2 runs each),
+gpt-oss-20b went from 6/10 to 9/10 and Qwen3.5-9B scored 10/10 with these on:
+
+- **Line numbers removed from file reads.** Cline's `read_files` prefixes every line with its number (` 11 | text`).
+  Small models copy the numbers into `apply_patch`, Cline applies the non-matching patch anyway (fuzzy), the numbers
+  end up in the file, and the model's repairs make it worse until it rewrites the whole file. The gate shows the
+  model plain lines, as a chat UI would.
+- **Repeat notes.** A tool call identical to an earlier one (same tool and arguments), and the 3rd+ edit of the same
+  file, get a short note on their result telling the model to move on or finish.
+- **`AGENT_MAX_TOKENS`** caps one step, so a model stuck in its own reasoning stops after a minute or two.
+
+All of these are worked out from the history alone, so each request gets exactly the same changes in the same places
+and llama-server's prompt cache stays valid.
 
 ### Embedding worker
 
