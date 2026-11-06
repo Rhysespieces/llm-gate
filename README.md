@@ -157,7 +157,8 @@ the folder read-only, e.g. `./rules:/rules:ro`.
 ### Agent safeguards (Cline with a small local model)
 
 Measured with real Cline CLI tasks (5 edits on CRLF PowerShell/batch/JSON files, checked automatically, 2 runs each),
-gpt-oss-20b went from 6/10 to 9/10 and Qwen3.5-9B scored 10/10 with these on:
+gpt-oss-20b went from 6/10 to 9/10 with these on. Other models with them on: Qwen3.5-9B 10/10, Gemma 4 26B-A4B
+7/10, Gemma 4 12B 5/10 (it failed the two multi-step tasks and was slowest, 2-9 min per task).
 
 - **Line numbers removed from file reads.** Cline's `read_files` prefixes every line with its number (` 11 | text`).
   Small models copy the numbers into `apply_patch`, Cline applies the non-matching patch anyway (fuzzy), the numbers
